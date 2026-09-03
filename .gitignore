@@ -1,0 +1,6 @@
+# Runtime, decompressed database (rebuilt from the shipped .xz on first use)
+data/webster1913.sqlite
+*.tmp
+
+# Local screenshots / scratch
+scratch/

@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# omarchy-lookup query engine.
+#
+#   dict-lookup "<word or phrase>"
+#
+# Consults every dictionary listed in config.json, in order, and prints a single
+# JSON document describing the result. The QML overlay renders whatever this
+# returns, so adding a new dictionary is purely a matter of dropping a
+# providers/<id>.json descriptor, teaching this script its "kind", and listing
+# the id in config.json — no QML changes required.
+#
+# Output schema:
+# {
+#   "query":      "<original query>",
+#   "word":       "<normalized primary token>",
+#   "found":      true|false,
+#   "sections": [ { "id","name","entries":[ {"headword","text"} ] } ],
+#   "suggestions":[ "..." ]        // near matches, when the exact word is missing
+# }
+set -euo pipefail
+
+plugin_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+config="$plugin_dir/config.json"
+cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-lookup"
+
+raw_query="${1:-}"
+
+emit() { printf '%s' "$1"; exit 0; }
+fail_empty() {
+  emit "$(jq -cn --arg q "$raw_query" '{query:$q, word:"", found:false, sections:[], suggestions:[]}')"
+}
+
+# ---- normalize the query -------------------------------------------------
+# Keep letters, digits, spaces, apostrophes and hyphens; collapse whitespace.
+norm="$(printf '%s' "$raw_query" \
+  | tr '[:upper:]' '[:lower:]' \
+  | tr -c "a-z0-9'’ -" ' ' \
+  | tr -s ' ' \
+  | sed -e 's/^ *//' -e 's/ *$//')"
+[[ -n "$norm" ]] || fail_empty
+
+first="${norm%% *}"
+
+# Build an ordered, de-duplicated list of lookup candidates: the whole phrase,
+# the first word, then light morphology on the first word so "running" resolves
+# to "run", "berries" to "berry", etc.
+declare -a cands=()
+add_cand() { local c="$1"; [[ -n "$c" ]] || return; for e in "${cands[@]:-}"; do [[ "$e" == "$c" ]] && return; done; cands+=("$c"); }
+
+add_cand "$norm"
+add_cand "$first"
+w="$first"
+case "$w" in
+  *ies) [[ ${#w} -gt 4 ]] && add_cand "${w%ies}y" ;;
+esac
+case "$w" in
+  *sses|*shes|*ches|*xes|*zes) add_cand "${w%es}" ;;
+  *es) [[ ${#w} -gt 3 ]] && add_cand "${w%s}"; [[ ${#w} -gt 3 ]] && add_cand "${w%es}" ;;
+esac
+case "$w" in
+  *s) [[ ${#w} -gt 3 ]] && add_cand "${w%s}" ;;
+esac
+case "$w" in
+  *ing) [[ ${#w} -gt 5 ]] && { add_cand "${w%ing}"; add_cand "${w%ing}e"; } ;;
+esac
+case "$w" in
+  *ed) [[ ${#w} -gt 4 ]] && { add_cand "${w%ed}"; add_cand "${w%d}"; add_cand "${w%ed}e"; } ;;
+esac
+case "$w" in
+  *ly) [[ ${#w} -gt 4 ]] && add_cand "${w%ly}" ;;
+esac
+case "$w" in
+  *er) [[ ${#w} -gt 4 ]] && add_cand "${w%er}" ;;
+  *est) [[ ${#w} -gt 5 ]] && add_cand "${w%est}" ;;
+esac
+
+sql_escape() { printf "%s" "$1" | sed "s/'/''/g"; }
+
+# ---- provider backends ---------------------------------------------------
+
+# Ensure the runtime SQLite file exists, decompressing the shipped .xz on first
+# use (or whenever the compressed source is newer). Echoes the runtime path.
+ensure_sqlite() {
+  local rel_db="$1" rel_src="$2"
+  local src="$plugin_dir/$rel_src"
+  local base; base="$(basename "$rel_db")"
+  local runtime="$cache_dir/$base"
+  if [[ -f "$plugin_dir/$rel_db" ]]; then
+    printf '%s' "$plugin_dir/$rel_db"; return 0          # uncompressed DB shipped
+  fi
+  [[ -f "$src" ]] || return 1
+  if [[ ! -f "$runtime" || "$src" -nt "$runtime" ]]; then
+    mkdir -p "$cache_dir"
+    if xz -dc "$src" >"$runtime.tmp" 2>/dev/null; then
+      mv -f "$runtime.tmp" "$runtime"
+    else
+      rm -f "$runtime.tmp"; return 1
+    fi
+  fi
+  printf '%s' "$runtime"
+}
+
+# Query one sqlite-backed dictionary. Prints a JSON array of {headword,text}
+# for the first candidate that hits; empty array if nothing matched.
+query_sqlite() {
+  local db="$1"; shift
+  local c esc rows
+  for c in "$@"; do
+    esc="$(sql_escape "$c")"
+    rows="$(sqlite3 "$db" \
+      "SELECT json_group_array(json_object('headword', headword, 'text', definition)) \
+       FROM (SELECT headword, definition FROM entries WHERE word='$esc' LIMIT 12);" 2>/dev/null || true)"
+    if [[ -n "$rows" && "$rows" != "[]" && "$rows" != "null" ]]; then
+      printf '%s' "$rows"; return 0
+    fi
+  done
+  printf '[]'
+}
+
+# "Did you mean" suggestions from a sqlite dictionary. Tries the full word as a
+# prefix, then backs off to shorter prefixes so a total miss ("serendipity")
+# still surfaces near neighbors. Prints a JSON array (possibly empty).
+suggest_sqlite() {
+  local db="$1" c="$2" p esc out
+  local n=${#c}
+  for (( p=n; p>=4; p-- )); do
+    esc="$(sql_escape "${c:0:p}")"
+    out="$(sqlite3 "$db" \
+      "SELECT json_group_array(word) FROM \
+         (SELECT DISTINCT word FROM entries WHERE word LIKE '$esc%' ORDER BY length(word), word LIMIT 8);" \
+      2>/dev/null || true)"
+    if [[ -n "$out" && "$out" != "[]" && "$out" != "null" ]]; then
+      printf '%s' "$out"; return 0
+    fi
+  done
+  printf '[]'
+}
+
+# ---- read provider order -------------------------------------------------
+order_json='["webster1913"]'
+if [[ -f "$config" ]]; then
+  o="$(jq -c '.order // ["webster1913"]' "$config" 2>/dev/null || true)"
+  [[ -n "$o" && "$o" != "null" ]] && order_json="$o"
+fi
+mapfile -t providers < <(jq -r '.[]' <<<"$order_json" 2>/dev/null || printf 'webster1913\n')
+
+# ---- consult each provider ----------------------------------------------
+sections='[]'
+suggestions='[]'
+any_found=0
+
+for pid in "${providers[@]}"; do
+  [[ -n "$pid" ]] || continue
+  desc="$plugin_dir/providers/$pid.json"
+  [[ -f "$desc" ]] || continue
+  name="$(jq -r '.name // .id' "$desc")"
+  kind="$(jq -r '.kind // ""' "$desc")"
+  entries='[]'
+
+  case "$kind" in
+    sqlite)
+      rel_db="$(jq -r '.db // ""' "$desc")"
+      rel_src="$(jq -r '.source // ""' "$desc")"
+      if db="$(ensure_sqlite "$rel_db" "$rel_src")" && [[ -n "$db" ]]; then
+        entries="$(query_sqlite "$db" "${cands[@]}")"
+        if [[ "$entries" == "[]" && "$suggestions" == "[]" ]]; then
+          suggestions="$(suggest_sqlite "$db" "$first")"
+          [[ -z "$suggestions" || "$suggestions" == "null" ]] && suggestions='[]'
+        fi
+      fi
+      ;;
+    *)
+      entries='[]'
+      ;;
+  esac
+
+  if [[ "$entries" != "[]" && "$entries" != "null" ]]; then
+    any_found=1
+  fi
+  sections="$(jq -c --arg id "$pid" --arg name "$name" --argjson entries "$entries" \
+    '. + [{id:$id, name:$name, entries:$entries}]' <<<"$sections")"
+done
+
+found=false; [[ "$any_found" == 1 ]] && found=true
+
+jq -cn \
+  --arg q "$raw_query" \
+  --arg word "$first" \
+  --argjson found "$found" \
+  --argjson sections "$sections" \
+  --argjson suggestions "$suggestions" \
+  '{query:$q, word:$word, found:$found, sections:$sections, suggestions:$suggestions}'

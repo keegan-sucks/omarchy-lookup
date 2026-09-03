@@ -1,0 +1,8 @@
+{
+  "id": "webster1913",
+  "name": "Webster's 1913",
+  "kind": "sqlite",
+  "db": "data/webster1913.sqlite",
+  "source": "data/webster1913.sqlite.xz",
+  "attribution": "Webster's Revised Unabridged Dictionary (1913), public domain."
+}

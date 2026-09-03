@@ -1,0 +1,6 @@
+{
+  "$comment": "Which dictionaries to consult, and in what order they appear. Each id must have a matching providers/<id>.json descriptor. Reorder the list to reorder the sections in the popup (just like macOS Dictionary's source order). Remove an id to hide it. This file hot-reloads; no restart needed.",
+  "order": [
+    "webster1913"
+  ]
+}

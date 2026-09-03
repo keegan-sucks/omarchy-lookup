@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.keegan-sucks.lookup",
+  "name": "Look Up",
+  "version": "0.1.0",
+  "author": "keegan-sucks",
+  "license": "MIT",
+  "description": "A macOS-style dictionary lookup popup. Select a word (or type one), press a hotkey, and see its definition from one or more dictionaries shown in the order you choose. Ships with Webster's 1913 as the offline base dictionary.",
+  "homepage": "https://github.com/keegan-sucks/omarchy-lookup",
+  "kinds": [
+    "overlay"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "LookUp.qml"
+  }
+}

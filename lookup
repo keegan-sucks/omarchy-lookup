@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# omarchy-lookup summon shortcut.
+#
+# Bind this to a key in ~/.config/hypr/bindings.lua. When pressed it reads the
+# Wayland *primary* selection (the text you have highlighted, left untouched in
+# your normal clipboard) and opens the Look Up popup on that word — macOS-style.
+# With nothing selected it just toggles an empty popup you can type into.
+#
+# Requires: wl-paste (wl-clipboard) and omarchy-shell (both ship with Omarchy).
+set -euo pipefail
+
+plugin_id="io.github.keegan-sucks.lookup"
+
+# Grab the primary selection as plain text, size-capped, without disturbing the
+# clipboard. Never fail the shortcut if there is no selection.
+selection="$(wl-paste --primary --no-newline --type text/plain 2>/dev/null | head -c 400 || true)"
+[[ -n "$selection" ]] || selection="$(wl-paste --primary --no-newline 2>/dev/null | head -c 400 || true)"
+
+# Normalize whitespace so a multi-line selection becomes a clean query.
+selection="$(printf '%s' "$selection" | tr '\n\t' '  ' | sed -e 's/^ *//' -e 's/ *$//')"
+
+if [[ -n "$selection" ]]; then
+  payload="$(jq -cn --arg q "$selection" '{query:$q}')"
+  omarchy-shell -q shell summon "$plugin_id" "$payload"
+else
+  # Nothing highlighted: toggle a blank popup to type into.
+  omarchy-shell -q shell toggle "$plugin_id" '{}'
+fi
