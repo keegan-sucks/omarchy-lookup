@@ -129,11 +129,28 @@ Item {
     t = t.replace(/Defn:\s*/g, "")
     // etymology / cross-references in [ ... ] -> italic
     t = t.replace(/\[([^\]]{1,160})\]/g, "<i>[$1]</i>")
-    // leading sense number -> bold
-    t = t.replace(/^\s*(\d{1,2}\.)\s+/, "<b>$1</b> ")
+    // Sense numbers -> bold headings, but ONLY genuine ones. Webster's text is
+    // full of incidental numbers (scripture citations like "Heb. xi. 6.",
+    // cross-references, quantities) that must not be mistaken for senses. A
+    // real sense number is either the next in sequence, or a "1." starting a
+    // new part-of-speech block (Webster restarts numbering per part of speech).
+    // The trailing space is matched with a lookahead so it is not consumed —
+    // otherwise a citation like "Gal. i. 23." would swallow the space before
+    // the real sense "5." that follows and hide it entirely.
+    var next = 1
+    function promote(n) {
+      if (n === next) { next += 1; return true }
+      if (n === 1) { next = 2; return true }
+      return false
+    }
+    // leading sense number "1." (no paragraph break before the first one)
+    t = t.replace(/^\s*(\d{1,2})\.(?=\s)/, function (m, n) {
+      return promote(parseInt(n, 10)) ? "<b>" + n + ".</b>" : m
+    })
     // "-- 2." style sense breaks and bare " 2. " -> new paragraph + bold
-    t = t.replace(/\s+--\s+(\d{1,2}\.)\s+/g, "<br><br><b>$1</b> ")
-    t = t.replace(/\s+(\d{1,2}\.)\s+/g, "<br><br><b>$1</b> ")
+    t = t.replace(/(\s+)(?:--\s+)?(\d{1,2})\.(?=\s)/g, function (m, ws, n) {
+      return promote(parseInt(n, 10)) ? "<br><br><b>" + n + ".</b>" : m
+    })
     // editorial labels onto their own line
     t = t.replace(/\s+(Note:|Syn\.|Usage:)\s*/g, "<br><i>$1</i> ")
     t = t.replace(/[ \t]{2,}/g, " ")
