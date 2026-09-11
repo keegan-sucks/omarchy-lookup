@@ -38,18 +38,33 @@ and you can add more and reorder them whenever you like.
 omarchy plugin add https://github.com/keegan-sucks/omarchy-lookup.git --enable
 ```
 
-Then bind a key in `~/.config/hypr/bindings.lua`:
-
-```lua
-o.bind("SUPER + ALT + L", "Look up word",
-  os.getenv("HOME") .. "/.config/omarchy/plugins/io.github.keegan-sucks.lookup/lookup")
-```
-
-Reload and check Hyprland:
+Then add a keybinding. The fastest way — paste this **into a terminal** once; it
+appends the binding to `~/.config/hypr/bindings.lua` (only if it isn't already
+there) and reloads Hyprland:
 
 ```bash
-hyprctl reload && hyprctl configerrors
+grep -q 'keegan-sucks.lookup/lookup' ~/.config/hypr/bindings.lua 2>/dev/null ||
+  cat >> ~/.config/hypr/bindings.lua <<'LUA'
+
+-- Look Up dictionary plugin
+o.bind("SUPER + ALT + L", "Look up word",
+  os.getenv("HOME") .. "/.config/omarchy/plugins/io.github.keegan-sucks.lookup/lookup")
+LUA
+hyprctl reload
 ```
+
+> Prefer to edit by hand, or want a different hotkey? Open
+> `~/.config/hypr/bindings.lua` and add this line yourself — it's **Lua config
+> that goes in the file**, not a command to run in a terminal:
+>
+> ```lua
+> o.bind("SUPER + ALT + L", "Look up word",
+>   os.getenv("HOME") .. "/.config/omarchy/plugins/io.github.keegan-sucks.lookup/lookup")
+> ```
+>
+> Then reload and check for errors: `hyprctl reload && hyprctl configerrors`.
+> If `SUPER + ALT + L` is already taken, pick another combo (and, per Omarchy's
+> docs, `hl.unbind(...)` the old one first).
 
 The first lookup transparently decompresses the bundled dictionary into
 `~/.cache/omarchy-lookup/` (a one-time, ~0.5s step).
