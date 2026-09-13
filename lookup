@@ -9,20 +9,35 @@
 # Requires: wl-paste (wl-clipboard) and omarchy-shell (both ship with Omarchy).
 set -euo pipefail
 
+# Run under a fixed, trusted PATH and resolve every helper to an absolute path, so a
+# hostile entry planted earlier in the user's PATH can never shadow the tools we call.
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/share/omarchy/bin
+pin() {  # <command> -> absolute path (or fail loudly)
+  local p; p="$(command -v -- "$1" 2>/dev/null || true)"
+  [[ -n "$p" && -x "$p" ]] || { printf 'omarchy-lookup: required command not found: %s\n' "$1" >&2; exit 127; }
+  printf '%s' "$p"
+}
+WL_PASTE="$(pin wl-paste)"
+HEAD="$(pin head)"
+TR="$(pin tr)"
+SED="$(pin sed)"
+JQ="$(pin jq)"
+OMARCHY_SHELL="$(pin omarchy-shell)"
+
 plugin_id="io.github.keegan-sucks.lookup"
 
 # Grab the primary selection as plain text, size-capped, without disturbing the
 # clipboard. Never fail the shortcut if there is no selection.
-selection="$(wl-paste --primary --no-newline --type text/plain 2>/dev/null | head -c 400 || true)"
-[[ -n "$selection" ]] || selection="$(wl-paste --primary --no-newline 2>/dev/null | head -c 400 || true)"
+selection="$("$WL_PASTE" --primary --no-newline --type text/plain 2>/dev/null | "$HEAD" -c 400 || true)"
+[[ -n "$selection" ]] || selection="$("$WL_PASTE" --primary --no-newline 2>/dev/null | "$HEAD" -c 400 || true)"
 
 # Normalize whitespace so a multi-line selection becomes a clean query.
-selection="$(printf '%s' "$selection" | tr '\n\t' '  ' | sed -e 's/^ *//' -e 's/ *$//')"
+selection="$(printf '%s' "$selection" | "$TR" '\n\t' '  ' | "$SED" -e 's/^ *//' -e 's/ *$//')"
 
 if [[ -n "$selection" ]]; then
-  payload="$(jq -cn --arg q "$selection" '{query:$q}')"
-  omarchy-shell -q shell summon "$plugin_id" "$payload"
+  payload="$("$JQ" -cn --arg q "$selection" '{query:$q}')"
+  "$OMARCHY_SHELL" -q shell summon "$plugin_id" "$payload"
 else
   # Nothing highlighted: toggle a blank popup to type into.
-  omarchy-shell -q shell toggle "$plugin_id" '{}'
+  "$OMARCHY_SHELL" -q shell toggle "$plugin_id" '{}'
 fi

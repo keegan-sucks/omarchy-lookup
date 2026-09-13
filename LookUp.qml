@@ -88,6 +88,10 @@ Item {
   // --- lookup process ------------------------------------------------------
   property string _pending: ""
   property bool _relaunch: false
+  // Bound the helper so a hung or oversized subprocess can never wedge or
+  // exhaust the shell process.
+  readonly property int lookupTimeoutMs: 8000
+  readonly property int maxOutputChars: 2000000    // ~2 MB; our JSON is far smaller
 
   function runLookup(q) {
     root._pending = q
@@ -98,16 +102,26 @@ Item {
 
   function _launch() {
     if (root._pending.trim().length === 0) { root.loading = false; return }
-    lookupProc.command = ["bash", root.scriptPath, root._pending]
+    // Absolute interpreter path — never resolve `bash` through an inherited PATH.
+    lookupProc.command = ["/usr/bin/bash", root.scriptPath, root._pending]
+    watchdog.restart()
     lookupProc.running = true
   }
 
-  function _onResult(txt) {
-    var r
-    try { r = JSON.parse(txt) } catch (e) { r = emptyResult() }
+  function _finish(r) {
+    watchdog.stop()
     root.result = r
     if (root._pending && root._pending !== (r.query || "")) root._relaunch = true
     else root.loading = false
+  }
+
+  function _onResult(txt) {
+    // Cap buffered output before parsing so an oversized result cannot blow up
+    // the shell process.
+    if (txt && txt.length > root.maxOutputChars) { _finish(emptyResult()); return }
+    var r
+    try { r = JSON.parse(txt) } catch (e) { r = emptyResult() }
+    _finish(r)
   }
 
   Process {
@@ -118,6 +132,20 @@ Item {
     }
     onRunningChanged: {
       if (!running && root._relaunch) { root._relaunch = false; root._launch() }
+    }
+  }
+
+  // Terminates a lookup that runs too long (a hung or replaced helper) and clears
+  // the UI. Cancelling _relaunch first means the async termination won't respawn it.
+  Timer {
+    id: watchdog
+    interval: root.lookupTimeoutMs
+    repeat: false
+    onTriggered: {
+      root._relaunch = false
+      root.loading = false
+      root.result = root.emptyResult()
+      if (lookupProc.running) lookupProc.running = false
     }
   }
 

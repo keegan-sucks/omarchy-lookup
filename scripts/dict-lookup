@@ -19,7 +19,24 @@
 # }
 set -euo pipefail
 
-plugin_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Run under a fixed, trusted PATH and resolve every helper to an absolute path, so a
+# hostile entry planted earlier in the user's PATH can never shadow the tools we call.
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/share/omarchy/bin
+pin() {  # <command> -> absolute path (or fail loudly)
+  local p; p="$(command -v -- "$1" 2>/dev/null || true)"
+  [[ -n "$p" && -x "$p" ]] || { printf 'omarchy-lookup: required command not found: %s\n' "$1" >&2; exit 127; }
+  printf '%s' "$p"
+}
+JQ="$(pin jq)"; SQLITE3="$(pin sqlite3)"; XZ="$(pin xz)"
+HEAD="$(pin head)"; WC="$(pin wc)"; MV="$(pin mv)"; RM="$(pin rm)"; MKDIR="$(pin mkdir)"
+CHMOD="$(pin chmod)"; MKTEMP="$(pin mktemp)"; DIRNAME="$(pin dirname)"; BASENAME="$(pin basename)"
+SED="$(pin sed)"; AWK="$(pin awk)"; TR="$(pin tr)"
+
+# Hard cap on the decompressed dictionary (real DB is ~28 MB); bounds a
+# decompression bomb from exhausting storage.
+readonly MAX_DB_BYTES=134217728   # 128 MiB
+
+plugin_dir="$(cd "$("$DIRNAME" "${BASH_SOURCE[0]}")/.." && pwd)"
 config="$plugin_dir/config.json"
 cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-lookup"
 
@@ -27,16 +44,16 @@ raw_query="${1:-}"
 
 emit() { printf '%s' "$1"; exit 0; }
 fail_empty() {
-  emit "$(jq -cn --arg q "$raw_query" '{query:$q, word:"", found:false, sections:[], suggestions:[]}')"
+  emit "$("$JQ" -cn --arg q "$raw_query" '{query:$q, word:"", found:false, sections:[], suggestions:[]}')"
 }
 
 # ---- normalize the query -------------------------------------------------
 # Keep letters, digits, spaces, apostrophes and hyphens; collapse whitespace.
 norm="$(printf '%s' "$raw_query" \
-  | tr '[:upper:]' '[:lower:]' \
-  | tr -c "a-z0-9'’ -" ' ' \
-  | tr -s ' ' \
-  | sed -e 's/^ *//' -e 's/ *$//')"
+  | "$TR" '[:upper:]' '[:lower:]' \
+  | "$TR" -c "a-z0-9'’ -" ' ' \
+  | "$TR" -s ' ' \
+  | "$SED" -e 's/^ *//' -e 's/ *$//')"
 [[ -n "$norm" ]] || fail_empty
 
 first="${norm%% *}"
@@ -74,7 +91,7 @@ case "$w" in
   *est) [[ ${#w} -gt 5 ]] && add_cand "${w%est}" ;;
 esac
 
-sql_escape() { printf "%s" "$1" | sed "s/'/''/g"; }
+sql_escape() { printf "%s" "$1" | "$SED" "s/'/''/g"; }
 
 # ---- provider backends ---------------------------------------------------
 
@@ -83,18 +100,49 @@ sql_escape() { printf "%s" "$1" | sed "s/'/''/g"; }
 ensure_sqlite() {
   local rel_db="$1" rel_src="$2"
   local src="$plugin_dir/$rel_src"
-  local base; base="$(basename "$rel_db")"
+  local base; base="$("$BASENAME" -- "$rel_db")"
   local runtime="$cache_dir/$base"
   if [[ -f "$plugin_dir/$rel_db" ]]; then
     printf '%s' "$plugin_dir/$rel_db"; return 0          # uncompressed DB shipped
   fi
   [[ -f "$src" ]] || return 1
+
+  # Refuse to operate through a symlinked cache directory (a swapped/planted link
+  # could redirect our writes and reads elsewhere). Then lock it to 0700, ours.
+  if [[ -L "$cache_dir" ]]; then return 1; fi
+  "$MKDIR" -p -- "$cache_dir" || return 1
+  [[ -d "$cache_dir" && ! -L "$cache_dir" ]] || return 1
+  "$CHMOD" 700 -- "$cache_dir" 2>/dev/null || true
+
+  # Never trust an existing runtime that is a symlink — a planted link could redirect
+  # both our write and our later read (and its target's mtime could game the freshness
+  # check below into skipping the rebuild). Drop it first, then rebuild from source.
+  if [[ -L "$runtime" ]]; then "$RM" -f -- "$runtime"; fi
+
+  # Rebuild only when the runtime copy is missing or older than the source.
   if [[ ! -f "$runtime" || "$src" -nt "$runtime" ]]; then
-    mkdir -p "$cache_dir"
-    if xz -dc "$src" >"$runtime.tmp" 2>/dev/null; then
-      mv -f "$runtime.tmp" "$runtime"
+    # Reject before extracting if the archive header already advertises more than
+    # the cap (a cheap decompression-bomb screen).
+    local adv
+    adv="$("$XZ" --robot -l -- "$src" 2>/dev/null | "$AWK" -F'\t' '$1=="file"{print $5; exit}')"
+    if [[ -n "$adv" && "$adv" =~ ^[0-9]+$ && "$adv" -gt "$MAX_DB_BYTES" ]]; then
+      return 1
+    fi
+    # Decompress into an unpredictable, O_EXCL temp file *inside* the locked cache
+    # dir (mktemp will not follow a pre-planted symlink), then atomically rename.
+    local tmp
+    tmp="$("$MKTEMP" -- "$cache_dir/.${base}.XXXXXX")" || return 1
+    # Hard byte cap as a backstop even if the header lied.
+    if "$XZ" -dc -- "$src" | "$HEAD" -c "$MAX_DB_BYTES" >"$tmp" 2>/dev/null; then
+      local got; got="$("$WC" -c <"$tmp")"
+      if [[ "$got" -ge "$MAX_DB_BYTES" ]]; then    # hit the cap => truncated/bomb
+        "$RM" -f -- "$tmp"; return 1
+      fi
+      [[ -L "$runtime" ]] && "$RM" -f -- "$runtime"   # never write through a link
+      "$CHMOD" 600 -- "$tmp" 2>/dev/null || true
+      "$MV" -f -- "$tmp" "$runtime"
     else
-      rm -f "$runtime.tmp"; return 1
+      "$RM" -f -- "$tmp"; return 1
     fi
   fi
   printf '%s' "$runtime"
@@ -107,7 +155,7 @@ query_sqlite() {
   local c esc rows
   for c in "$@"; do
     esc="$(sql_escape "$c")"
-    rows="$(sqlite3 "$db" \
+    rows="$("$SQLITE3" "$db" \
       "SELECT json_group_array(json_object('headword', headword, 'text', definition)) \
        FROM (SELECT headword, definition FROM entries WHERE word='$esc' LIMIT 12);" 2>/dev/null || true)"
     if [[ -n "$rows" && "$rows" != "[]" && "$rows" != "null" ]]; then
@@ -125,7 +173,7 @@ suggest_sqlite() {
   local n=${#c}
   for (( p=n; p>=4; p-- )); do
     esc="$(sql_escape "${c:0:p}")"
-    out="$(sqlite3 "$db" \
+    out="$("$SQLITE3" "$db" \
       "SELECT json_group_array(word) FROM \
          (SELECT DISTINCT word FROM entries WHERE word LIKE '$esc%' ORDER BY length(word), word LIMIT 8);" \
       2>/dev/null || true)"
@@ -139,10 +187,10 @@ suggest_sqlite() {
 # ---- read provider order -------------------------------------------------
 order_json='["webster1913"]'
 if [[ -f "$config" ]]; then
-  o="$(jq -c '.order // ["webster1913"]' "$config" 2>/dev/null || true)"
+  o="$("$JQ" -c '.order // ["webster1913"]' "$config" 2>/dev/null || true)"
   [[ -n "$o" && "$o" != "null" ]] && order_json="$o"
 fi
-mapfile -t providers < <(jq -r '.[]' <<<"$order_json" 2>/dev/null || printf 'webster1913\n')
+mapfile -t providers < <("$JQ" -r '.[]' <<<"$order_json" 2>/dev/null || printf 'webster1913\n')
 
 # ---- consult each provider ----------------------------------------------
 sections='[]'
@@ -153,14 +201,14 @@ for pid in "${providers[@]}"; do
   [[ -n "$pid" ]] || continue
   desc="$plugin_dir/providers/$pid.json"
   [[ -f "$desc" ]] || continue
-  name="$(jq -r '.name // .id' "$desc")"
-  kind="$(jq -r '.kind // ""' "$desc")"
+  name="$("$JQ" -r '.name // .id' "$desc")"
+  kind="$("$JQ" -r '.kind // ""' "$desc")"
   entries='[]'
 
   case "$kind" in
     sqlite)
-      rel_db="$(jq -r '.db // ""' "$desc")"
-      rel_src="$(jq -r '.source // ""' "$desc")"
+      rel_db="$("$JQ" -r '.db // ""' "$desc")"
+      rel_src="$("$JQ" -r '.source // ""' "$desc")"
       if db="$(ensure_sqlite "$rel_db" "$rel_src")" && [[ -n "$db" ]]; then
         entries="$(query_sqlite "$db" "${cands[@]}")"
         if [[ "$entries" == "[]" && "$suggestions" == "[]" ]]; then
@@ -177,13 +225,13 @@ for pid in "${providers[@]}"; do
   if [[ "$entries" != "[]" && "$entries" != "null" ]]; then
     any_found=1
   fi
-  sections="$(jq -c --arg id "$pid" --arg name "$name" --argjson entries "$entries" \
+  sections="$("$JQ" -c --arg id "$pid" --arg name "$name" --argjson entries "$entries" \
     '. + [{id:$id, name:$name, entries:$entries}]' <<<"$sections")"
 done
 
 found=false; [[ "$any_found" == 1 ]] && found=true
 
-jq -cn \
+"$JQ" -cn \
   --arg q "$raw_query" \
   --arg word "$first" \
   --argjson found "$found" \
